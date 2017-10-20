@@ -1,7 +1,7 @@
 package adclient
 
-// #cgo CPPFLAGS: -DOPENLDAP
-// #cgo LDFLAGS: -lstdc++ -lldap -lsasl2 -lstdc++ -llber -lresolv
+// #cgo CPPFLAGS: -DOPENLDAP -DKRB5
+// #cgo LDFLAGS: -lstdc++ -lldap -lsasl2 -lstdc++ -llber -lresolv -lkrb5
 import "C"
 
 import "fmt"
@@ -11,6 +11,43 @@ import "strconv"
 type ADError struct {
 	msg  string
 	code int
+}
+
+type ADConnParams struct {
+	Domain      string
+	Site        string
+	Uries       []string
+	Binddn      string
+	Bindpw      string
+	Search_base string
+	Secured     bool
+	UseGSSAPI   bool
+	Nettimeout  int
+	Timelimit   int
+}
+
+func DefaultADConnParams() (params ADConnParams) {
+	params.Nettimeout = -1
+	params.Timelimit = -1
+	params.Secured = true
+	params.UseGSSAPI = false
+	return
+}
+
+func LdapPrefix() string {
+	return GetAdclientLdap_prefix()
+}
+
+func Ldap_servers(domain string, site string) []string {
+	vector := AdclientGet_ldap_servers(domain, site)
+	defer DeleteStringVector(vector)
+	result := vector2slice(vector)
+	return result
+}
+
+func Domain2dn(domain string) string {
+	dn := AdclientDomain2dn(domain)
+	return dn
 }
 
 func (err ADError) Error() string {
@@ -80,9 +117,6 @@ func commonEmptyToSlice(f func() StringVector) (result []string, err error) {
 
 var ad Adclient
 
-var Nettimeout int = -1
-var Timelimit int = -1
-
 func New() {
 	ad = NewAdclient()
 }
@@ -91,35 +125,67 @@ func Delete() {
 	DeleteAdclient(ad)
 }
 
-func Login(uri interface{}, user string, passwd string, sb string, secured bool) (err error) {
+func Login(_params ADConnParams) (err error) {
 	defer catch(&err)
-	if Nettimeout != -1 {
-		ad.SetNettimeout(Nettimeout)
+
+	params := NewAdConnParams()
+	defer DeleteAdConnParams(params)
+
+	params.SetDomain(_params.Domain)
+	params.SetSite(_params.Site)
+	params.SetBinddn(_params.Binddn)
+	params.SetBindpw(_params.Bindpw)
+	params.SetSearch_base(_params.Search_base)
+	params.SetSecured(_params.Secured)
+	params.SetUse_gssapi(_params.UseGSSAPI)
+	params.SetNettimeout(_params.Nettimeout)
+	params.SetTimelimit(_params.Timelimit)
+
+	uries := NewStringVector()
+	defer DeleteStringVector(uries)
+	for _, uri := range _params.Uries {
+		uries.Add(uri)
 	}
-	if Timelimit != -1 {
-		ad.SetTimelimit(Timelimit)
-	}
+	params.SetUries(uries)
+
+	ad.Login(params)
+	return
+}
+
+func LoginOld(uri interface{}, user string, passwd string, sb string, secured bool) (err error) {
+	defer catch(&err)
+
+	args := DefaultADConnParams()
+	args.Binddn = user
+	args.Bindpw = passwd
+	args.Search_base = sb
+	args.UseGSSAPI = secured
+
 	switch uri.(type) {
 	case string:
-		ad.Login(uri.(string), user, passwd, sb, secured)
+		args.Domain = uri.(string)
 	case []string:
-		uries := NewStringVector()
-		defer DeleteStringVector(uries)
-		for _, suri := range uri.([]string) {
-			uries.Add(suri)
-		}
-		ad.Login(uries, user, passwd, sb, secured)
+		args.Uries = uri.([]string)
 	default:
 		err = ADError{
 			fmt.Sprintf("unknown uri type - %#v", uri),
 			-1,
 		}
 	}
+	Login(args)
 	return
 }
 
 func BindedUri() (result string) {
 	return ad.Binded_uri()
+}
+
+func SearchBase() (result string) {
+	return ad.Search_base()
+}
+
+func LoginMethod() (result string) {
+	return ad.Login_method()
 }
 
 func GroupAddUser(group string, user string) (err error) {
@@ -155,6 +221,18 @@ func CreateGroup(cn string, container string, group_short string) (err error) {
 func DeleteDN(dn string) (err error) {
 	defer catch(&err)
 	ad.DeleteDN(dn)
+	return
+}
+
+func RenameDN(dn string, new_rdn string) (err error) {
+	defer catch(&err)
+	ad.RenameDN(dn, new_rdn)
+	return
+}
+
+func RenameGroup(dn string, new_rdn string) (err error) {
+	defer catch(&err)
+	ad.RenameGroup(dn, new_rdn)
 	return
 }
 
@@ -410,10 +488,6 @@ func GetUsersInOU(OU string, scope int) (result []string, err error) {
 	return commonStringsIntToSlice(ad.GetUsersInOU, OU, scope)
 }
 
-/*
-   struct berval getBinaryObjectAttribute(string object, string attribute);
-*/
-
 func GetObjectAttribute(object string, attribute string) (result []string, err error) {
 	return common2StringsToSlice(ad.GetObjectAttribute, object, attribute)
 }
@@ -423,6 +497,34 @@ func SearchDN(search_base string, filter string, scope int) (result []string, er
 	vector := ad.SearchDN(search_base, filter, scope)
 	defer DeleteStringVector(vector)
 	result = vector2slice(vector)
+	return
+}
+
+func SetObjectAttribute(object string, attr string, value string) (err error) {
+	defer catch(&err)
+	ad.SetObjectAttribute(object, attr, value)
+	return
+}
+
+func MoveObject(object string, new_container string) (err error) {
+	defer catch(&err)
+	ad.MoveObject(object, new_container)
+	return
+}
+
+func MoveUser(user string, new_container string) (err error) {
+	defer catch(&err)
+	ad.MoveUser(user, new_container)
+	return
+}
+
+func RenameUser(user string, shortname string, cn_optional ...string) (err error) {
+	cn := ""
+	if len(cn_optional) > 0 {
+		cn = cn_optional[0]
+	}
+	defer catch(&err)
+	ad.RenameUser(user, shortname, cn)
 	return
 }
 

@@ -1,4 +1,4 @@
-/* 
+/*
    C++ Active Directory manipulation class.
    Based on adtool by Mike Dawson (http://gp2x.org/adtool/).
 */
@@ -7,12 +7,15 @@
 #define _ADCLIENT_H_
 
 #include <ldap.h>
-#include <sasl/sasl.h>
+
+#ifdef KRB5
+#include <krb5.h>
+#endif
 
 #if defined( OPENLDAP )
-	#define LDAPOPTSUCCESS LDAP_OPT_SUCCESS
+    #define LDAPOPTSUCCESS LDAP_OPT_SUCCESS
 #elif defined( SUNLDAP )
-	#define LDAPOPTSUCCESS LDAP_SUCCESS
+    #define LDAPOPTSUCCESS LDAP_SUCCESS
 #endif
 
 /*#include <mpatrol.h>*/
@@ -58,10 +61,13 @@ using std::string;
 using std::cout;
 using std::endl;
 
-struct sasl_defaults {
-    string username;
-    string password;
+#ifdef KRB5
+struct krb_struct {
+    krb5_context context;
+    char *mem_cache_env;
+    krb5_ccache cc;
 };
+#endif
 
 class ADException {
 public:
@@ -85,6 +91,37 @@ public:
       ADOperationalException(string _msg, int _code): ADException(_msg, _code) {}
 };
 
+struct adConnParams {
+    public:
+        string domain;
+        string site;
+        vector<string> uries;
+        string binddn;
+        string bindpw;
+        string search_base;
+        bool secured;
+        bool use_gssapi;
+
+        // LDAP_OPT_NETWORK_TIMEOUT, LDAP_OPT_TIMEOUT
+        int nettimeout;
+        // LDAP_OPT_TIMELIMIT
+        int timelimit;
+
+        adConnParams() :
+            secured(true),
+            use_gssapi(false),
+            // by default do not touch timeouts
+            nettimeout(-1), timelimit(-1)
+        {};
+
+        friend class adclient;
+
+    private:
+        string uri;
+        string login_method;
+};
+
+
 class adclient {
 public:
       adclient();
@@ -93,21 +130,29 @@ public:
       static std::vector<string> get_ldap_servers(string domain, string site = "");
       static string domain2dn(string domain);
 
+      void login(adConnParams _params);
       void login(string uri, string binddn, string bindpw, string search_base, bool secured = true);
       void login(std::vector <string> uries, string binddn, string bindpw, string search_base, bool secured = true);
 
-      string binded_uri() { return uri; }
+      string binded_uri() { return params.uri; }
+      string search_base() { return params.search_base; }
+      string login_method() { return params.login_method; }
 
       void groupAddUser(string group, string user);
       void groupRemoveUser(string group, string user);
       void CreateUser(string cn, string container, string user_short);
       void CreateGroup(string cn, string container, string group_short);
+      void RenameGroup(string group, string shortname, string cn="");
       void CreateComputer(string name, string container);
       void CreateOU(string ou);
       void DeleteDN(string dn);
+      void RenameDN(string object, string cn);
       void EnableUser(string user);
       void DisableUser(string user);
       void UnLockUser(string user);
+      void MoveUser(string user, string new_container);
+      void RenameUser(string user, string shortname, string cn="");
+      void MoveObject(string object, string new_container);
 
       void setUserPassword(string user, string password);
       void changeUserPassword(string user, string old_password, string new_password);
@@ -128,7 +173,7 @@ public:
       void setUserDescription(string user, string descr);
       void setUserIpAddress(string user, string ip);
 
-      void setObjectAttribute(string object, string attr, string ip);
+      void setObjectAttribute(string object, string attr, string value);
       void clearObjectAttribute(string object, string attr);
 
       std::map <string, bool>    getUserControls(string user);
@@ -167,7 +212,6 @@ public:
       std::vector <string> getGroupsInOU(string OU, int scope);
       std::vector <string> getComputersInOU(string OU, int scope);
 
-      struct berval getBinaryObjectAttribute(string object, string attribute);
       std::vector <string> getObjectAttribute(string object, string attribute);
 
       std::vector <string> searchDN(string search_base, string filter, int scope);
@@ -176,29 +220,34 @@ public:
       std::map <string, std::vector <string> > getObjectAttributes(string object);
       std::map <string, std::vector <string> > getObjectAttributes(string object, const std::vector<string> &attributes);
 
-      // LDAP_OPT_NETWORK_TIMEOUT, LDAP_OPT_TIMEOUT
-      int nettimeout;
-      // LDAP_OPT_TIMELIMIT
-      int timelimit;
+      static const string ldap_prefix;
 private:
-      string uri;
-      string default_search_base;
-      LDAP *ds;
-      string ldap_prefix;
+      adConnParams params;
 
-      void login(LDAP **ds, string uri, string binddn, string bindpw, string search_base, bool secured);
+      LDAP *ds;
+
+      void login(LDAP **ds, adConnParams& _params);
       void logout(LDAP *ds);
 
       void mod_add(string object, string attribute, string value);
       void mod_delete(string object, string attribute, string value);
+      void mod_rename(string object, string cn);
       void mod_replace(string object, string attribute, string value);
+      void mod_move(string object, string new_container);
       std::map < string, std::vector<string> > _getvalues(LDAPMessage *entry);
       string dn2domain(string dn);
+      vector < std::pair<string, string> > explode_dn(string dn);
+      string merge_dn(vector < std::pair<string, string> > dn_exploded);
       std::vector <string> DNsToShortNames(std::vector <string> &v);
 
       static std::vector<string> perform_srv_query(string srv_rec);
       static struct berval password2berval(string password);
 };
+
+inline string upper(string input) {
+    std::transform(input.begin(), input.end(), input.begin(), ::toupper);
+    return input;
+}
 
 inline string vector2string(const std::vector<string> &v, std::string separator = ", ") {
     std::stringstream ss;
@@ -329,5 +378,54 @@ inline string int2ip(string value) {
     ip += itos(BinToDec(fourthOctet));
     return ip;
 }
+
+inline string decodeSID(string sid) {
+/*
+  It is taken from http://www.adamretter.org.uk/blog/entries/active-directory-ldap-users-primary-group.xml
+*/
+    std::stringstream result;
+    result << "S-";
+
+    // version
+    result << int(sid[0]);
+
+    // count of sub-authorities
+    int countSubAuths = int(sid[1]) & 0xFF;
+
+    result << "-";
+
+    // get the authority
+    long authority = 0;
+    for (int i = 2; i <= 7; i++) {
+        authority |= ((long)sid[i]) << (8 * (5 - (i - 2)));
+    }
+    result << authority;
+
+    // iterate all the sub-auths
+    int offset = 8;
+    int size = 4; // 4 bytes for each sub auth
+    for (int j = 0; j < countSubAuths; j++) {
+        long subAuthority = 0;
+        for (int k = 0; k < size; k++) {
+            subAuthority |= (long)(sid[offset + k] & 0xFF) << (8 * k);
+        }
+
+        result << "-";
+        result << subAuthority;
+
+        offset += size;
+    }
+
+    return result.str();
+}
+
+int sasl_bind_digest_md5(LDAP *ds, string binddn, string bindpw);
+int sasl_bind_simple(LDAP *ds, string binddn, string bindpw);
+#ifdef KRB5
+int krb5_create_cache(const char *domain);
+void krb5_cleanup(krb_struct &krb_param);
+int sasl_bind_gssapi(LDAP *ds);
+int sasl_rebind_gssapi(LDAP * ld, LDAP_CONST char *url, ber_tag_t request, ber_int_t msgid, void *params);
+#endif
 
 #endif // _ADCLIENT_H_
